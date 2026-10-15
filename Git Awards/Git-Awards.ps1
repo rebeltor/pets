@@ -4,10 +4,20 @@
     Holiday party awards from your git history (and GitHub PRs).
 
 .DESCRIPTION
-    Scans one or more git repositories and produces a leaderboard for ~24 funny
-    and serious developer awards, plus GitHub-based Mentor and Quick Draw awards.
-    Every award is calculated separately for each repository, so each repo gets
-    its own winners and more people get a shot at first place.
+    Scans one or more git repositories and produces a leaderboard for ~26 funny
+    and serious developer awards, plus GitHub-based awards from merged pull
+    requests: Mentor, Quick Draw, The Gatekeeper (most PRs reviewed) and Review
+    Dodger (fewest). Every award is calculated separately for each repository,
+    so each repo gets its own winners and more people get a shot at first place.
+
+    The AI awards only count things that leave a measurable trace: AI Whisperer
+    (commits carrying an AI co-author trailer such as "Co-Authored-By: Claude",
+    i.e. the agent wrote the commit), Prompt Engineer (commits that edit AI
+    instruction files such as CLAUDE.md, AGENTS.md, .claude/ or .cursor/) and
+    Seat Warmer (the GitHub Copilot seat that has gone unused the longest, read
+    from the org's seat list, which needs an org owner's gh login). Changes an
+    agent made that a person then tested and committed by hand leave no trace
+    in git, so no award tries to guess at them.
 
     The report is a markdown matrix: one row per award, one column per repo
     (plus an "All Repos" column, skip it with -NoCombined), and the top N
@@ -35,7 +45,7 @@
 .PARAMETER Exclude
     Regex matched against git author names, emails and GitHub logins; matches are
     skipped as bots. Default: [bot] accounts, dependabot, github-actions,
-    renovate, claude, copilot, compile and amp-autopilot.
+    renovate, claude, copilot, compile, amp-autopilot, chatgpt and codex.
 
 .PARAMETER Top
     How many finishers to show per award per repo. Default 3.
@@ -46,13 +56,17 @@
 
 .PARAMETER NoCombined
     Only report per-repo awards; skip the "All Repos" column/section.
-    Cross-Product Champion is only awarded for all repos combined.
+    Cross-Product Champion and Seat Warmer are only awarded for all repos combined.
+
+.PARAMETER NoCopilot
+    Skip the Seat Warmer award (it reads the org's Copilot seat list).
 
 .PARAMETER GhMap
-    Map a GitHub login to the name used in git, e.g. -GhMap 'jsmith=John Smith'.
+    Map a GitHub login (or GitHub display name) to the name used in git, e.g.
+    -GhMap 'jsmith=John Smith'.
 
 .EXAMPLE
-    ./Git-Awards.ps1 D:\git\repo1 D:\git\repo2 D:\git\repo3 -Out awards.md
+    ./Git-Awards.ps1 D:\git\AIMS D:\git\AIMSEvents D:\git\AIMSLicenseGenerator D:\git\AIMSMobile5 D:\git\AIMSMobilePay D:\git\AIMSMobilePay2 D:\git\AIMSMobilePayApp D:\git\AIMSTextMessaging D:\git\AIMSWeb90 D:\git\ConversionExporter -GhMap 'EDC-Collin=Collin Puchta' -Out awards.md
 
 .EXAMPLE
     ./Git-Awards.ps1 .\repo1 -Since '2025-12-01' -AllBranches -MinCommits 10 -GhMap 'jsmith=John Smith'
@@ -68,11 +82,12 @@ param(
     [string]$Until,
     [switch]$AllBranches,
     [int]$MinCommits = 5,
-    [string]$Exclude = '\[bot\]|dependabot|github-actions|renovate|\bclaude\b|\bcopilot\b|\bcompile\b|amp-autopilot',
+    [string]$Exclude = '\[bot\]|dependabot|github-actions|renovate|\bclaude\b|\bcopilot\b|\bcompile\b|amp-autopilot|chatgpt|\bcodex\b',
     [int]$Top = 3,
     [string]$Out,
     [string[]]$Github = @(),
     [switch]$NoGithub,
+    [switch]$NoCopilot,
     [string[]]$GhMap = @(),
     [int]$MinPrs = 5,
     [int]$PrLimit = 1000,
@@ -102,12 +117,20 @@ $ic = [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
 $reNoise   = [regex]::new('(package-lock\.json|yarn\.lock|pnpm-lock\.yaml|composer\.lock|\.min\.(js|css)|(^|/)(node_modules|vendor|dist|build|bin|obj)/|\.(svg|map|dll|exe|png|jpg|gif|pdf)$)', $ic)
 $reDoc     = [regex]::new('(\.md$|\.rst$|(^|/)docs?/|readme)', $ic)
 $reTest    = [regex]::new('(test|spec|__tests__)', $ic)
-$reApology = [regex]::new('\b(oops|whoops|typo|sorry|lost|my fault|forgot|forgotten|my bad|fix fix|missed|silly|derp|d''oh)\b', $ic)
-$reSwear   = [regex]::new('\b(damn|dammit|hell|crap|wtf|sucks|shit\w*|fuck\w*|bastard|piss\w*|ass)\b', $ic)
-$reBugfix  = [regex]::new('\b(fix(es|ed)?|bug|hotfix|glitch|correct(s|ed)?|patch(s|ed)?|resolve[sd]?|closes?)\b', $ic)
+$reApology = [regex]::new('\b(oops|whoops|typo|forgot|forgotten|my bad|fix fix|missed|silly|derp|d''oh)\b', $ic)
+$reSwear   = [regex]::new('\b(damn|dammit|hell|crap|wtf|shit\w*|fuck\w*|bastard|piss\w*|ass)\b', $ic)
+$reBugfix  = [regex]::new('\b(fix(es|ed)?|bug|hotfix|resolve[sd]?|closes?)\b', $ic)
 $reTicket  = [regex]::new('\b[A-Z][A-Z0-9]+-\d+\b|#\d+')
 $reGeneric = [regex]::new('^(fix|fixes|wip|update|updates|stuff|asdf+|test|tmp|misc|changes?|commit|minor|more|\.+)\W*$', $ic)
 $reEmoji   = [regex]::new('[\uD83C-\uD83E][\uDC00-\uDFFF]|[\u2600-\u27BF]|(?<!\w):[a-z][a-z0-9_+-]*:', $ic)
+# AI-assisted commit: a co-author trailer naming an AI tool (Claude Code, Copilot,
+# Amp, Cursor, aider, ...) or a "Generated with" footer. Matched per line.
+$reAI      = [regex]::new('^co-authored-by:.*\b(claude|anthropic|copilot|cursor|aider|chatgpt|openai|gemini|codex|devin|windsurf|amp-autopilot|ampcode)\b|@amp\.local|generated with \[?(claude|copilot|cursor|amp)\b|\bai-generated\b|\(aider\)',
+                          $ic -bor [System.Text.RegularExpressions.RegexOptions]::Multiline)
+# AI instruction / config files (Claude Code, Codex, Gemini, Cursor, Copilot,
+# Windsurf, Cline, Roo, aider, MCP). Third-party copies (vendor/, node_modules/) don't count.
+$reAiFiles    = [regex]::new('(^|/)(CLAUDE|AGENTS|GEMINI)\.md$|(^|/)copilot-instructions\.md$|(^|/)\.(cursorrules|windsurfrules|clinerules|roomodes|mcp\.json|aider[^/]*)$|(^|/)\.(claude|cursor|codex|amp|continue|roo|windsurf|gemini|github/(instructions|prompts|agents))/', $ic)
+$reThirdParty = [regex]::new('(^|/)([^/]*vendor[^/]*|node_modules|bower_components|third[-_]?party)/', $ic)
 $reExclude = if ($Exclude) { [regex]::new($Exclude, $ic) } else { $null }
 
 # ----------------------------------------------------------------- helpers
@@ -177,7 +200,7 @@ function New-Stat {
     $h = @{}
     foreach ($k in 'commits', 'merges', 'conflict_merges', 'after5', 'vampire', 'early', 'weekend',
                    'friday_late', 'holiday', 'msg_len', 'subj_len', 'generic', 'apology', 'reverts',
-                   'bugfix', 'emoji', 'swear', 'added', 'deleted', 'files', 'docs', 'tests', 'big') {
+                   'bugfix', 'emoji', 'swear', 'ai', 'ai_files', 'added', 'deleted', 'files', 'docs', 'tests', 'big') {
         $h[$k] = 0
     }
     $h
@@ -265,6 +288,8 @@ function Measure-Commit($c) {
         bugfix      = [int]($reBugfix.IsMatch($msg) -or $reTicket.IsMatch($msg))
         emoji       = [int]($reEmoji.IsMatch($msg))
         swear       = $reSwear.Matches($msg).Count
+        ai          = [int]($reAI.IsMatch($msg))
+        ai_files    = 0
         added       = 0
         deleted     = 0
         files       = 0
@@ -277,6 +302,7 @@ function Measure-Commit($c) {
         $path = $bits[2]
         if ($reDoc.IsMatch($path)) { $inc.docs = 1 }
         if ($reTest.IsMatch($path)) { $inc.tests = 1 }
+        if ($reAiFiles.IsMatch($path) -and -not $reThirdParty.IsMatch($path)) { $inc.ai_files = 1 }
         if ($reNoise.IsMatch($path) -or $bits[0] -eq '-') { continue }
         $inc.added += [int]$bits[0]
         $inc.deleted += [int]$bits[1]
@@ -318,6 +344,7 @@ function Complete-Bucket($b) {
         $s.avg_msg  = if ($n) { $s.msg_len / $n } else { 0 }
         $s.avg_subj = if ($n) { $s.subj_len / $n } else { 0 }
         $s.avg_size = if ($n) { $s.lines / $n } else { 0 }
+        $s.ai_share = if ($n) { $s.ai / $n } else { 0 }
     }
 }
 
@@ -353,10 +380,17 @@ function ConvertTo-UtcDate($v) {
 
 function Test-GhSkip($Login) { (-not $Login) -or ($reExclude -and $reExclude.IsMatch($Login)) }
 
+# Per-person GitHub record: review submissions, inline comments, open-to-merge
+# hours of their own merged PRs, and the distinct PRs ("owner/repo#n") they reviewed.
+function New-GhRecord {
+    @{ reviews = 0; inline = 0
+       hours = [System.Collections.Generic.List[double]]::new()
+       reviewed = [System.Collections.Generic.HashSet[string]]::new()
+       has_seat = $false; seat_last = $null; seat_editor = '' }
+}
+
 function Get-GhUser($Users, [string]$Login) {
-    if (-not $Users.ContainsKey($Login)) {
-        $Users[$Login] = @{ reviews = 0; inline = 0; hours = [System.Collections.Generic.List[double]]::new() }
-    }
+    if (-not $Users.ContainsKey($Login)) { $Users[$Login] = New-GhRecord }
     $Users[$Login]
 }
 
@@ -400,6 +434,7 @@ function Get-GitHubData([string[]]$Slugs, [long]$SinceTs) {
                 if ((Test-GhSkip $rl) -or $rl -eq $login -or $r.state -eq 'PENDING') { continue }
                 $u = Get-GhUser $users $rl
                 $u.reviews++
+                [void]$u.reviewed.Add("$slug#$($pr.number)")
             }
         }
 
@@ -414,10 +449,57 @@ function Get-GitHubData([string[]]$Slugs, [long]$SinceTs) {
             if ((Test-GhSkip $c.u) -or $c.u -eq $prAuthor[$num]) { continue }
             $u = Get-GhUser $users $c.u
             $u.inline++
+            [void]$u.reviewed.Add("$slug#$num")
         }
         $bySlug[$slug] = $users
     }
-    @{ BySlug = $bySlug; Names = $names }
+
+    # Copilot seats: login -> @{ last = [datetime] (UTC) or $null; editor }. Needs an org owner.
+    $seats = @{}
+    if (-not $NoCopilot) {
+        foreach ($owner in @($Slugs | ForEach-Object { ($_ -split '/')[0] } | Select-Object -Unique)) {
+            Write-Host "Fetching Copilot seats for $owner ..."
+            try {
+                $raw = Invoke-Gh @('api', '--paginate', "orgs/$owner/copilot/billing/seats?per_page=100",
+                    '--jq', '.seats[] | {l: .assignee.login, a: .last_activity_at, e: .last_activity_editor}')
+            } catch {
+                Write-Warning "Could not read Copilot seats for $owner (needs an org owner's gh login); skipping Seat Warmer: $($_.Exception.Message)"
+                continue
+            }
+            foreach ($line in ($raw -split "`n")) {
+                if (-not $line.Trim()) { continue }
+                try { $seat = $line | ConvertFrom-Json } catch { continue }
+                if (-not $seat.l -or (Test-GhSkip $seat.l)) { continue }
+                $seats[$seat.l] = @{ last = $(if ($seat.a) { ConvertTo-UtcDate $seat.a } else { $null }); editor = "$($seat.e)" }
+            }
+        }
+    }
+    @{ BySlug = $bySlug; Names = $names; Seats = $seats }
+}
+
+# GitHub login -> report name: -GhMap first, then the PR author's display name,
+# then a case-insensitive match against the git author names.
+function Resolve-GhName([string]$Login, $Names, $Override, $Lower) {
+    if ($Override.ContainsKey($Login)) { return $Override[$Login] }
+    $hint = if ($Names.ContainsKey($Login)) { $Names[$Login] } else { '' }
+    if ($hint -and $Override.ContainsKey($hint)) { return $Override[$hint] }
+    $key = $(if ($hint) { $hint } else { $Login }).ToLowerInvariant()
+    if ($Lower.ContainsKey($key)) { $Lower[$key] } elseif ($hint) { $hint } else { $Login }
+}
+
+# Attach Copilot seat info to a merged user table. Only people with PR activity
+# or commits in the scanned repos are added, so the report never lists the whole
+# seat roster.
+function Add-GhSeats($Merged, $Seats, $Names, $Override, $Lower, $Committers) {
+    foreach ($login in $Seats.Keys) {
+        $display = Resolve-GhName $login $Names $Override $Lower
+        if (-not ($Merged.ContainsKey($display) -or $Committers.ContainsKey($display))) { continue }
+        if (-not $Merged.ContainsKey($display)) { $Merged[$display] = New-GhRecord }
+        $m = $Merged[$display]
+        $m.has_seat = $true
+        $m.seat_last = $Seats[$login].last
+        $m.seat_editor = $Seats[$login].editor
+    }
 }
 
 # Combine one or more per-slug user tables, mapping GitHub logins to git author names.
@@ -426,19 +508,13 @@ function Merge-GhUsers($UserTables, $Names, $Override, $Lower) {
     foreach ($users in @($UserTables)) {
         foreach ($login in $users.Keys) {
             $u = $users[$login]
-            $display = if ($Override.ContainsKey($login)) { $Override[$login] }
-                       else {
-                           $hint = if ($Names.ContainsKey($login)) { $Names[$login] } else { '' }
-                           if ($hint -and $Lower.ContainsKey($hint.ToLowerInvariant())) { $Lower[$hint.ToLowerInvariant()] }
-                           elseif ($hint) { $hint } else { $login }
-                       }
-            if (-not $merged.ContainsKey($display)) {
-                $merged[$display] = @{ reviews = 0; inline = 0; hours = [System.Collections.Generic.List[double]]::new() }
-            }
+            $display = Resolve-GhName $login $Names $Override $Lower
+            if (-not $merged.ContainsKey($display)) { $merged[$display] = New-GhRecord }
             $mm = $merged[$display]
             $mm.reviews += $u.reviews
             $mm.inline += $u.inline
             $mm.hours.AddRange($u.hours)
+            $mm.reviewed.UnionWith($u.reviewed)
         }
     }
     $merged
@@ -497,6 +573,8 @@ $awards = @(
     New-Award 'Funny' 'Emoji Enthusiast' 'Most commits containing emoji or :shortcodes:' { param($s) $s.emoji } { param($s) "$(Format-Num $s.emoji) emoji commits" } 1 $true
     New-Award 'Funny' 'Swear Jar' 'Most colorful language in commit messages' { param($s) $s.swear } { param($s) "$(Format-Num $s.swear) naughty words" } 1 $true
     New-Award 'Funny' 'Big Bang' 'Largest single commit' { param($s) $s.big } { param($s) "$(Format-Num $s.big) lines in one commit" } 1 $true
+    New-Award 'Funny' 'AI Whisperer' 'Most commits written by an AI agent (co-author trailers such as "Co-Authored-By: Claude")' { param($s) $s.ai } { param($s) "$(Format-Num $s.ai) agent-written commits, $([math]::Round($s.ai_share * 100))% of theirs" } 1 $true
+    New-Award 'Funny' 'Prompt Engineer' 'Most commits editing AI instruction files (CLAUDE.md, AGENTS.md, .claude/, .cursor/, copilot-instructions.md, ...)' { param($s) $s.ai_files } { param($s) "$(Format-Num $s.ai_files) commits teaching the AI" } 1 $true
 )
 
 $ghAwards = @(
@@ -515,7 +593,35 @@ $ghAwards = @(
        Ok    = { param($u) $u.hours.Count -ge $MinPrs }
        Score = { param($u) Get-Median $u.hours }
        Disp  = { param($u) "$(Format-Duration (Get-Median $u.hours)) median over $($u.hours.Count) PRs" }
-       High  = $false }
+       High  = $false },
+    [pscustomobject]@{
+       Cat   = 'GitHub'
+       Title = 'The Gatekeeper'
+       Blurb = "Reviewed the most of other people's pull requests"
+       Ok    = { param($u) $true }
+       Score = { param($u) $u.reviewed.Count }
+       Disp  = { param($u) "$(Format-Num $u.reviewed.Count) PRs reviewed" }
+       High  = $true },
+    [pscustomobject]@{
+       Cat   = 'GitHub'
+       Title = 'Review Dodger'
+       Blurb = "Reviewed the fewest pull requests while getting their own merged (min $MinPrs merged PRs; ties go to whoever had more merged)"
+       Ok    = { param($u) $u.hours.Count -ge $MinPrs }
+       Score = { param($u) $u.reviewed.Count * 100000 - $u.hours.Count }
+       Disp  = { param($u) "$(Format-Num $u.reviewed.Count) PRs reviewed vs $(Format-Num $u.hours.Count) of their own merged" }
+       High  = $false },
+    [pscustomobject]@{
+       Cat   = 'GitHub'
+       Title = 'Seat Warmer'
+       Blurb = 'Copilot seat that has gone unused the longest (people with commits or PR activity here only; a never-used seat ranks first)'
+       Ok    = { param($u) $u.has_seat }
+       Score = { param($u) if ($u.seat_last) { ([datetime]::UtcNow - $u.seat_last).TotalDays } else { 1e6 } }
+       Disp  = { param($u)
+                 if (-not $u.seat_last) { return 'never used their Copilot seat' }
+                 $editor = ($u.seat_editor -split '/')[0]
+                 "last Copilot activity $($u.seat_last.ToString('yyyy-MM-dd'))$(if ($editor) { " in $editor" }), $(Format-Num ([datetime]::UtcNow - $u.seat_last).TotalDays) days ago" }
+       High  = $true
+       CombinedOnly = $true }
 )
 
 $medals = '1st', '2nd', '3rd'
@@ -554,7 +660,7 @@ function Get-GhRanking($Merged, $ga) {
         $u = $Merged[$name]
         if (-not (& $ga.Ok $u)) { continue }
         $score = [double](& $ga.Score $u)
-        if ($score -le 0) { continue }
+        if ($ga.High -and $score -eq 0) { continue }
         [pscustomobject]@{ Name = $name; U = $u; Score = $score }
     }
     $pool = @($pool)
@@ -622,6 +728,7 @@ if ($gh) {
 }
 if (-not $NoCombined) {
     $allGh = if ($gh) { Merge-GhUsers $gh.BySlug.Values $gh.Names $override $lower } else { $null }
+    if ($null -ne $allGh -and $gh.Seats.Count) { Add-GhSeats $allGh $gh.Seats $gh.Names $override $lower $all.Stats }
     $columns.Add(@{ Label = 'All Repos'; Bucket = $all; Gh = $allGh; Slug = $null; Combined = $true
                     Note = "$(Format-Num $all.Total) commits, $($all.Stats.Count) authors" })
 }
@@ -646,7 +753,7 @@ if ($gh) {
         $any = $false
         foreach ($col in $columns) {
             $r = $null
-            if ($null -ne $col.Gh) { $r = @(Get-GhRanking $col.Gh $ga) }
+            if ($null -ne $col.Gh -and -not ($ga.CombinedOnly -and -not $col.Combined)) { $r = @(Get-GhRanking $col.Gh $ga) }
             $cells[$col.Label] = $r
             if ($r -and $r.Count) { $any = $true; Add-Winner $r[0].Name $ga.Title $col.Label }
         }
@@ -730,6 +837,7 @@ function Write-SectionsLayout {
         if ($null -ne $col.Gh) {
             $report.Add($(if ($col.Slug) { "### GitHub Awards ($($col.Slug))" } else { '### GitHub Awards' })); $report.Add('')
             foreach ($row in $ghRows) {
+                if ($row.Award.CombinedOnly -and -not $col.Combined) { continue }
                 $r = $row.Cells[$col.Label]
                 $report.Add("#### $($row.Award.Title)"); $report.Add("_$($row.Award.Blurb)_")
                 if (-not $r -or $r.Count -eq 0) { $report.Add('- (no qualifying data)'); $report.Add(''); continue }
